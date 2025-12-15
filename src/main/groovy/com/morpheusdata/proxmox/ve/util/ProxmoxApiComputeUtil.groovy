@@ -1080,4 +1080,99 @@ class ProxmoxApiComputeUtil {
         }
         return rtn
     }
+
+    /**
+     * Get VNC connection parameters for a Proxmox VM
+     * Returns VNC proxy information that Morpheus/Guacamole can use to establish a tunneled VNC connection
+     *
+     * When Morpheus uses Guacamole as a remote tunnel, it needs the VNC host, port, and password
+     * rather than a direct NoVNC URL. Guacamole will then proxy the VNC connection through itself.
+     *
+     * @param client HttpApiClient instance
+     * @param authConfig Authentication configuration map
+     * @param nodeId Proxmox node ID (e.g., "pve-node01")
+     * @param vmId VM ID (e.g., "100")
+     * @return ServiceResponse with VNC connection parameters for Guacamole (host, port, password)
+     */
+    static ServiceResponse getNoVNCConsoleUrl(HttpApiClient client, Map authConfig, String nodeId, String vmId) {
+        log.info("Getting VNC connection parameters for VM $vmId on node $nodeId")
+
+        def rtn = new ServiceResponse(success: false)
+
+        try {
+            def tokenCfg = getApiV2Token(authConfig).data
+
+            // Request VNC proxy ticket from Proxmox
+            def opts = [
+                headers: [
+                    'Content-Type': 'application/json',
+                    'Cookie': "PVEAuthCookie=$tokenCfg.token",
+                    'CSRFPreventionToken': tokenCfg.csrfToken
+                ],
+                body: [
+                    websocket: 1  // Request WebSocket-based VNC (compatible with tunneling)
+                ],
+                contentType: ContentType.APPLICATION_JSON,
+                ignoreSSL: true
+            ]
+
+            def results = client.callJsonApi(
+                (String) authConfig.apiUrl,
+                "${authConfig.v2basePath}/nodes/$nodeId/qemu/$vmId/vncproxy",
+                null, null,
+                new HttpApiClient.RequestOptions(opts),
+                'POST'
+            )
+
+            if (results?.success && !results?.hasErrors()) {
+                def vncData = results.data.data
+                log.info("VNC Proxy Ticket Data obtained: port=${vncData.port}, user=${vncData.user}")
+
+                // Extract host from apiUrl (remove protocol, port, and path)
+                String host = authConfig.apiUrl
+                if (host.contains('://')) {
+                    host = host.substring(host.indexOf('://') + 3)
+                }
+                if (host.contains('/')) {
+                    host = host.substring(0, host.indexOf('/'))
+                }
+                if (host.contains(':')) {
+                    host = host.substring(0, host.indexOf(':'))
+                }
+
+                log.info("VNC connection target: ${host}:${vncData.port}")
+
+                // Return VNC connection parameters for Morpheus/Guacamole
+                // Guacamole will establish the VNC connection using these parameters
+                rtn.success = true
+                rtn.data = [
+                    // Primary connection parameters for Guacamole
+                    host: host,                    // Proxmox host (e.g., "proxmox.example.com")
+                    port: vncData.port,            // VNC port (e.g., 5900)
+                    password: vncData.ticket,      // VNC ticket acts as password
+
+                    // Additional metadata
+                    node: nodeId,
+                    vmid: vmId,
+                    user: vncData.user,
+                    cert: vncData.cert,
+
+                    // Legacy/fallback: some implementations may still check for consoleUrl
+                    consoleUrl: "vnc://${host}:${vncData.port}"
+                ]
+                log.info("Successfully obtained VNC connection parameters for Guacamole tunnel rtn = $rtn")
+            } else {
+                rtn.success = false
+                rtn.msg = "Failed to get VNC proxy ticket: ${results.data}"
+                log.error("Failed to get VNC proxy ticket for VM $vmId: ${results.data}")
+            }
+
+        } catch (e) {
+            log.error "Error getting VNC connection parameters for VM $vmId: ${e}", e
+            rtn.success = false
+            rtn.msg = "Error getting VNC connection parameters: ${e.message}"
+        }
+
+        return rtn
+    }
 }

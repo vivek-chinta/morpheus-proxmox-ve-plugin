@@ -125,9 +125,21 @@ class VMSync {
                 parentServer     : parentServer,
                 osType           : 'unknown',
                 serverOs         : new OsType(code: 'unknown'),
-                category         : "proxmox.ve.vm.${cloud.id}",
-                computeServerType: computeServerType
+                category         : "proxmox.ve.vm.${cloud.id}", computeServerType: computeServerType
             )
+
+            newVM.consoleType = 'vnc'
+
+            // Set console host for Guacamole VNC access
+            try {
+                String apiUrl = cloud.serviceUrl ?: cloud.configMap?.apiUrl
+                if (apiUrl) {
+                    newVM.consoleHost = new java.net.URI(apiUrl).getHost()
+                }
+            } catch (e) {
+                log.warn("Unable to set console host for VM ${cloudItem.name}: ${e.message}")
+            }
+
             newVMs << newVM
         }
         
@@ -167,6 +179,24 @@ class VMSync {
                         usedCpu    : usedCpuPercent.toLong(),
                         powerState : cloudPowerState
                 ]
+
+                // Ensure console properties are set for VNC access
+                if (!existingItem.consoleType || existingItem.consoleType != 'vnc') {
+                    existingItem.consoleType = 'vnc'
+                    needsUpdate = true
+                }
+
+                if (!existingItem.consoleHost) {
+                    try {
+                        String apiUrl = cloud.serviceUrl ?: cloud.configMap?.apiUrl
+                        if (apiUrl) {
+                            existingItem.consoleHost = new java.net.URI(apiUrl).getHost()
+                            needsUpdate = true
+                        }
+                    } catch (e) {
+                        log.warn("Unable to set console host for VM ${existingItem.name}: ${e.message}")
+                    }
+                }
 
                 Map capacityFieldValueMap = [
                         maxCores   : cloudItem.maxCores ?: cloudItem.maxcpu?.toLong(),

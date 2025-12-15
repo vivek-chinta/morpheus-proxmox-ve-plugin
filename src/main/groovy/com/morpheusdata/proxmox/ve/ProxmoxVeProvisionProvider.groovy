@@ -7,6 +7,7 @@ import com.morpheusdata.core.Plugin
 import com.morpheusdata.core.data.DataFilter
 import com.morpheusdata.core.data.DataQuery
 import com.morpheusdata.core.providers.HostProvisionProvider
+import com.morpheusdata.core.providers.ProvisionProvider
 import com.morpheusdata.core.providers.VmProvisionProvider
 import com.morpheusdata.core.util.ComputeUtility
 import com.morpheusdata.core.util.HttpApiClient
@@ -43,13 +44,19 @@ import com.morpheusdata.response.ServiceResponse
 import com.morpheusdata.proxmox.ve.util.ProxmoxApiComputeUtil
 import com.morpheusdata.proxmox.ve.util.ProxmoxMiscUtil
 import groovy.util.logging.Slf4j
+import org.apache.http.client.utils.URIBuilder
 
 /**
  * @author Neil van Rensburg
  */
 
 @Slf4j
-class ProxmoxVeProvisionProvider extends AbstractProvisionProvider implements VmProvisionProvider, WorkloadProvisionProvider, WorkloadProvisionProvider.ResizeFacet, HostProvisionProvider.ResizeFacet { //, ProvisionProvider.BlockDeviceNameFacet {
+class ProxmoxVeProvisionProvider extends AbstractProvisionProvider implements
+        VmProvisionProvider,
+        WorkloadProvisionProvider,
+        WorkloadProvisionProvider.ResizeFacet,
+        HostProvisionProvider.ResizeFacet,
+        ProvisionProvider.HypervisorConsoleFacet { //, ProvisionProvider.BlockDeviceNameFacet {
 	public static final String PROVISION_PROVIDER_CODE = 'proxmox-provision-provider'
 
     // Validation error messages
@@ -563,11 +570,31 @@ class ProxmoxVeProvisionProvider extends AbstractProvisionProvider implements Vm
 			server.serverType = 'vm'
 			server.managed = true
 			server.discovered = false
+
+			// Configure VNC console access for hypervisor console (primary)
+			server.consoleType = 'vnc'
+			try {
+				String apiUrl = cloud.serviceUrl ?: cloud.configMap?.apiUrl
+				if (apiUrl) {
+					server.consoleHost = new URIBuilder(apiUrl)?.getHost()
+					log.warn("*** HYPERVISOR CONSOLE configured: type=vnc, host=${server.consoleHost} ***")
+				}
+			} catch (e) {
+				log.warn("Unable to set console host: ${e.message}")
+			}
+
+			// Guest console type for OS-level access (secondary, after VM boots)
+			// Only set if you want guest OS console instead of hypervisor console
+			// Commenting out to ensure hypervisor console (VNC) is used
+			/*
 			if(server.osType == 'windows') {
 				server.guestConsoleType = ComputeServer.GuestConsoleType.rdp
 			} else if(server.osType == 'linux') {
 				server.guestConsoleType = ComputeServer.GuestConsoleType.ssh
 			}
+			*/
+			log.warn("*** NOT setting guestConsoleType to avoid conflict with hypervisor VNC console ***")
+
 			server.account = cloud.getAccount()
 			server.cloud = cloud
 			server = saveAndGet(server)
@@ -583,6 +610,13 @@ class ProxmoxVeProvisionProvider extends AbstractProvisionProvider implements Vm
 			server.internalId = rtnClone.data.vmId
 			server.externalId = rtnClone.data.vmId
 			server = saveAndGet(server)
+
+			// Link the server back to the workload for console access
+			workload.server = server
+			def workloadSaveResult = context.services.workload.save(workload)
+			log.warn("*** WORKLOAD SAVE RESULT: ${workloadSaveResult} ***")
+			log.warn("*** WORKLOAD ${workload.id} SERVER: ${workload.server?.id} ***")
+			log.warn("*** SAVED SERVER ID: ${server.id} ***")
 
 			if (!rtnClone.success) {
 				log.error("Provisioning/clone failed: $rtnClone.msg")
@@ -600,6 +634,46 @@ class ProxmoxVeProvisionProvider extends AbstractProvisionProvider implements Vm
 			}
 
 			ProxmoxApiComputeUtil.startVM(client, authConfig, nodeId, rtnClone.data.vmId)
+
+			// Get VNC console credentials after VM starts
+			log.warn("*** Attempting to get initial VNC credentials after VM start ***")
+			Thread.sleep(2000) // Wait for VM to fully start and VNC to be available
+			try {
+				ServiceResponse vncResponse = ProxmoxApiComputeUtil.getNoVNCConsoleUrl(client, authConfig, nodeId, rtnClone.data.vmId)
+				log.warn("*** VNC Response received: success=${vncResponse.success} ***")
+				log.warn("*** VNC Response data: ${vncResponse.data} ***")
+				log.warn("*** VNC Response data class: ${vncResponse.data?.getClass()} ***")
+
+				if (vncResponse.success && vncResponse.data) {
+					log.warn("*** VNC Data - host: ${vncResponse.data.host}, port: ${vncResponse.data.port}, password: ${vncResponse.data.password} ***")
+					log.warn("*** Port class: ${vncResponse.data.port?.getClass()}, Password class: ${vncResponse.data.password?.getClass()} ***")
+
+					// Convert port to Integer if it's a String
+					def port = vncResponse.data.port
+					if (port instanceof String) {
+						server.consolePort = Integer.parseInt(port)
+						log.warn("*** Converted port from String to Integer: ${server.consolePort} ***")
+					} else if (port instanceof Integer) {
+						server.consolePort = port
+						log.warn("*** Port already Integer: ${server.consolePort} ***")
+					} else if (port != null) {
+						server.consolePort = port.toInteger()
+						log.warn("*** Converted port to Integer: ${server.consolePort} ***")
+					}
+
+					server.consolePassword = vncResponse.data.password?.toString()
+					log.warn("*** Before save - consolePort: ${server.consolePort}, consolePassword length: ${server.consolePassword?.length()} ***")
+
+					server = saveAndGet(server)
+
+					log.warn("*** After save - consolePort: ${server.consolePort}, consolePassword length: ${server.consolePassword?.length()} ***")
+					log.warn("*** Initial VNC credentials set: port=${server.consolePort}, password set: ${server.consolePassword ? 'YES' : 'NO'} ***")
+				} else {
+					log.warn("Could not get initial VNC credentials (will be retrieved when console accessed): ${vncResponse.msg}")
+				}
+			} catch (e) {
+				log.error("Could not get initial VNC credentials (will be retrieved when console accessed): ${e.message}", e)
+			}
 
 			return new ServiceResponse<ProvisionResponse>(
 					true,
@@ -1278,4 +1352,103 @@ class ProxmoxVeProvisionProvider extends AbstractProvisionProvider implements Vm
 	Boolean computeZonePoolRequired() {
 		return false
 	}
+
+    @Override
+    ServiceResponse getNoVNCConsoleUrl(ComputeServer server) {
+        log.warn("*** getNoVNCConsoleUrl CALLED for VM: ${server.externalId} ***")
+        log.warn("*** Server consoleType: ${server.consoleType}, consoleHost: ${server.consoleHost} ***")
+
+        try {
+            HttpApiClient client = new HttpApiClient()
+            Map authConfig = plugin.getAuthConfig(server.cloud)
+
+            return ProxmoxApiComputeUtil.getNoVNCConsoleUrl(client, authConfig, server.parentServer.name, server.externalId)
+        } catch (e) {
+            log.error("Error getting NoVNC console URL for VM: ${e}", e)
+            return ServiceResponse.error("Error getting NoVNC console URL for VM: ${e}")
+        }
+    }
+
+    @Override
+    ServiceResponse enableConsoleAccess(ComputeServer server) {
+        log.warn("*** enableConsoleAccess CALLED for VM: ${server.externalId} ***")
+        server.consoleType = 'vnc'
+
+        // Get fresh VNC ticket from Proxmox and set console credentials
+        try {
+            ServiceResponse vncResponse = getNoVNCConsoleUrl(server)
+            if (vncResponse.success && vncResponse.data) {
+                server.consoleHost = vncResponse.data.host?.toString()
+
+                // Convert port to Integer if it's a String
+                def port = vncResponse.data.port
+                if (port instanceof String) {
+                    server.consolePort = Integer.parseInt(port)
+                } else if (port instanceof Integer) {
+                    server.consolePort = port
+                } else if (port != null) {
+                    server.consolePort = port.toInteger()
+                }
+
+                server.consolePassword = vncResponse.data.password?.toString()
+                log.warn("*** Console credentials updated: host=${server.consoleHost}, port=${server.consolePort}, password set: ${server.consolePassword ? 'YES' : 'NO'} ***")
+            } else {
+                log.error("Failed to get VNC credentials: ${vncResponse.msg}")
+            }
+        } catch (e) {
+            log.error("Error getting VNC credentials: ${e}", e)
+        }
+
+        return updateServerHost(server)
+    }
+
+    @Override
+    ServiceResponse updateServerHost(ComputeServer server) {
+        log.warn("*** updateServerHost CALLED for VM: ${server.externalId} ***")
+        String apiUrl = server.cloud.serviceUrl ?: server.cloud.configMap?.apiUrl
+        log.info("API URL: $apiUrl")
+
+        if (!server.consoleHost) {
+            server.consoleHost = new URIBuilder(apiUrl)?.getHost()
+        }
+        log.info("Console Host set to: $server.consoleHost")
+
+        server = saveAndGet(server)
+        return ServiceResponse.success(server)
+    }
+
+    /**
+     * Refresh console credentials by getting a new VNC ticket
+     * Called periodically or when console access is requested
+     */
+    ServiceResponse refreshConsoleCredentials(ComputeServer server) {
+        log.warn("*** refreshConsoleCredentials CALLED for VM: ${server.externalId} ***")
+
+        try {
+            ServiceResponse vncResponse = getNoVNCConsoleUrl(server)
+            if (vncResponse.success && vncResponse.data) {
+                server.consoleHost = vncResponse.data.host?.toString()
+
+                // Convert port to Integer if it's a String
+                def port = vncResponse.data.port
+                if (port instanceof String) {
+                    server.consolePort = Integer.parseInt(port)
+                } else if (port instanceof Integer) {
+                    server.consolePort = port
+                } else if (port != null) {
+                    server.consolePort = port.toInteger()
+                }
+
+                server.consolePassword = vncResponse.data.password?.toString()
+                server = saveAndGet(server)
+                log.warn("*** Console credentials refreshed successfully ***")
+                return ServiceResponse.success(server)
+            } else {
+                return ServiceResponse.error("Failed to refresh console credentials: ${vncResponse.msg}")
+            }
+        } catch (e) {
+            log.error("Error refreshing console credentials: ${e}", e)
+            return ServiceResponse.error("Error refreshing console credentials: ${e.message}")
+        }
+    }
 }
